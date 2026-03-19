@@ -1,0 +1,17 @@
+# Nim
+nimcache/
+*.out
+src/cyclomat
+*.exe
+
+# System
+.DS_Store
+Thumbs.db
+
+# Editors
+.vscode/
+.idea/
+*.swp
+
+# Testing
+test_env/
