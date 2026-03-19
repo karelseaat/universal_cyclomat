@@ -8,6 +8,7 @@ A lightweight, fast, and universal tool to measure cyclomatic complexity across 
 - 🌍 **Universal**: Supports Python, Java, JavaScript, TypeScript, PHP, C, and C++.
 - 📊 **Statistics**: View total, average, min, and max complexity.
 - 🤖 **CI/CD Ready**: Set complexity thresholds (`--max`) to fail builds on complex code.
+- 🔬 **PCC Metric**: Calculates Pseudo-Cyclomatic Complexity (Complexity / Function Count) to estimate function-level complexity.
 - 📄 **JSON Output**: Easy integration with other tools.
 - 🔍 **Flexible**: Exclude patterns and recursive directory scanning.
 
@@ -15,17 +16,29 @@ A lightweight, fast, and universal tool to measure cyclomatic complexity across 
 
 You need [Nim](https://nim-lang.org/install.html) installed.
 
+### Option A: Standalone CLI
+
 ```bash
-# Compile the tool
-nim c -d:release src/cyclomat.nim
+make build
+# Creates ./cyclomat binary
 ```
 
-This will create the `src/cyclomat` binary.
+### Option B: Python Library
+
+To build the Python extension, you first need the `nimpy` package:
+
+```bash
+nimble install nimpy
+make pylib
+# Creates cyclomat.so (Linux/Mac) or cyclomat.pyd (Windows)
+```
 
 ## Usage
 
+### CLI Usage
+
 ```bash
-./src/cyclomat [options] <file_or_directory>...
+./cyclomat [options] <file_or_directory>...
 ```
 
 ### Options
@@ -41,23 +54,67 @@ This will create the `src/cyclomat` binary.
 
 **Basic Scan**
 ```bash
-./src/cyclomat src/
+./cyclomat src/
 ```
 
 **With Statistics**
 ```bash
-./src/cyclomat --stats src/
+./cyclomat --stats src/
 ```
 
 **CI Pipeline (Fail if complexity > 10)**
 ```bash
-./src/cyclomat --max:10 src/
+./cyclomat --max:10 src/
 ```
 
 **Ignore folders**
 ```bash
-./src/cyclomat --exclude:tests --exclude:vendor src/
+./cyclomat --exclude:tests --exclude:vendor src/
 ```
+
+## Python Library Usage
+
+You can use `cyclomat` as a Python extension module for high-performance analysis.
+
+1. **Compile the extension**:
+   ```bash
+   make pylib
+   # Creates cyclomat.so (Linux/Mac) or cyclomat.pyd (Windows)
+   ```
+
+2. **Use in Python**:
+   ```python
+   import cyclomat
+
+   # Analyze a file
+   result = cyclomat.analyze_file("src/utils.js")
+   print(result)
+   # {'file': 'src/utils.js', 'complexity': 10, 'functions': 4, 'pcc': 2.5}
+
+   # Analyze raw content
+   code = "def foo(): if True: pass"
+   result = cyclomat.analyze_content(code, "test.py")
+   print(result)
+   # {'file': 'test.py', 'complexity': 2, 'functions': 1, 'pcc': 2.0}
+   ```
+
+## Understanding Metrics
+
+### Total Complexity (File-Level)
+The tool calculates the total cyclomatic complexity for each file. This is the sum of all decision points (branches) in the file + 1.
+
+### PCC (Pseudo Cyclomatic Complexity)
+Because total complexity can be misleading for large files with many small functions, the tool also calculates **PCC**.
+
+**Formula:**
+```math
+PCC = \frac{\text{Total File Complexity}}{\text{Number of Functions}}
+```
+
+**Interpretation:**
+*   **Low PCC (< 5)**: Indicates the file is composed of simple, small functions. Generally healthy.
+*   **High PCC (> 10)**: Indicates the file likely contains one or more complex "God functions" or deeply nested logic.
+*   **Warning**: PCC is an average. A file with 1 massive function (Complexity 50) and 49 tiny getters (Complexity 1) will show a low PCC (~2). Use PCC to measure **complexity density**.
 
 ## Supported Languages
 
@@ -67,10 +124,11 @@ This will create the `src/cyclomat` binary.
 | JavaScript | `.js`, `.jsx` |
 | TypeScript | `.ts`, `.tsx` |
 | Java | `.java` |
+| Go | `.go` |
 | PHP | `.php` |
 | C | `.c`, `.h` |
 | C++ | `.cpp`, `.hpp`, `.cc`, `.cxx` |
 
 ## How it Works
 
-The tool uses Parsing Expression Grammars (PEGs) to efficiently scan source code for control flow structures (like `if`, `for`, `while`, `case`, `catch`, `&&`, `||`). It does not require full AST parsing, making it extremely fast and tolerant of partial code.
+The tool uses a custom lexer to efficiently scan source code for control flow structures (like `if`, `for`, `while`, `case`, `catch`, `&&`, `||`). It respects string literals, comments, and word boundaries to avoid false positives. It does not perform full AST parsing, making it extremely fast.
