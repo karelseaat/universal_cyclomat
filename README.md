@@ -5,7 +5,7 @@ A lightweight, fast, and universal tool to measure cyclomatic complexity across 
 ## Features
 
 - 🚀 **Fast**: Built with Nim for native performance.
-- 🌍 **Universal**: Supports Python, Java, JavaScript, TypeScript, PHP, C, and C++.
+- 🌍 **Universal**: Supports Python, Java, JavaScript, TypeScript, PHP, C, C++, and Go.
 - 📊 **Statistics**: View total, average, min, and max complexity.
 - 🤖 **CI/CD Ready**: Set complexity thresholds (`--max`) to fail builds on complex code.
 - 🔬 **PCC Metric**: Calculates Pseudo-Cyclomatic Complexity (Complexity / Function Count) to estimate function-level complexity.
@@ -52,7 +52,7 @@ make pylib
 | `-f`, `--functions` | Show per-function complexity breakdown |
 | `-m`, `--max:N` | Fail (exit code 1) if any file exceeds complexity N |
 | `-e`, `--exclude:PAT` | Exclude files or directories matching the pattern |
-| `--lang:LANG` | Override language (python, js, ts, go, php, c, cpp, java) |
+| `--lang:LANG` | Override language (python, js, jsx, ts, tsx, go, golang, php, c, h, cpp, c++, hpp, java) |
 | `-h`, `--help` | Show help message |
 | `-V`, `--version` | Show version information |
 
@@ -152,13 +152,13 @@ PCC = \frac{\text{Total File Complexity}}{\text{Number of Functions}}
 | Language | Extensions |
 |----------|------------|
 | Python | `.py` |
-| JavaScript | `.js`, `.jsx` |
-| TypeScript | `.ts`, `.tsx` |
+| JavaScript | `.js`, `.jsx`, `.mjs`, `.cjs` |
+| TypeScript | `.ts`, `.tsx`, `.mts`, `.cts` |
 | Java | `.java` |
 | Go | `.go` |
 | PHP | `.php` |
 | C | `.c`, `.h` |
-| C++ | `.cpp`, `.hpp`, `.cc`, `.cxx` |
+| C++ | `.cpp`, `.hpp`, `.cc`, `.cxx`, `.hh` |
 
 ## How it Works
 

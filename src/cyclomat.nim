@@ -523,7 +523,7 @@ when defined(python):
 # CLI Implementation
 # ---------------------------------------------------------------------------
 
-proc recordFileAnalysis(filename: string, res: AnalysisResult, stats: var Stats, opts: Options): JsonNode =
+proc recordFileAnalysis*(filename: string, res: AnalysisResult, stats: var Stats, opts: Options): JsonNode =
   let pcc = if res.functions > 0: res.complexity.float / res.functions.float else: 0.0
 
   stats.count += 1
@@ -599,7 +599,7 @@ proc processFile(filename: string, stats: var Stats, opts: Options): JsonNode =
       stderr.writeLine(fmt"Error reading {filename}")
     return nil
 
-proc walk(path: string, stats: var Stats, opts: Options, jsonList: var seq[JsonNode]) =
+proc walk*(path: string, stats: var Stats, opts: Options, jsonList: var seq[JsonNode]) =
   if isExcluded(path, opts.excludePatterns):
     return
 

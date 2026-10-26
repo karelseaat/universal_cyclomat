@@ -1,4 +1,7 @@
 import unittest
+import json
+import os
+import std/tempfiles
 import ../src/cyclomat
 
 suite "Cyclomat Test Suite":
@@ -195,3 +198,101 @@ function hasNullable(?string $name): ?int {
     let res = calculateComplexity(phpCode, langCStyle, tsLike = false, phpLike = true)
     check res.complexity == 1
     check res.functions == 1
+
+  test "C-style Ternary, && and || Decision Points":
+    let cCode = """
+int calc(int a, int b) {
+    return a > 0 ? a : b;
+}
+int check(int a, int b) {
+    if (a > 0 && b > 0 || a == b) {
+        return 1;
+    }
+    return 0;
+}
+"""
+    let res = calculateComplexity(cCode, langCStyle)
+    # Total: 1 (base) + 1 (ternary) + 1 (if) + 1 (&&) + 1 (||) = 5
+    check res.complexity == 5
+    check res.functions == 2
+    check res.funcList.len == 2
+    check res.funcList[0].name == "calc"
+    check res.funcList[0].complexity == 2
+    check res.funcList[1].name == "check"
+    check res.funcList[1].complexity == 4
+
+  test "langFromString CLI Aliases":
+    check langFromString("python") == langPython
+    check langFromString("py") == langPython
+    check langFromString("GO") == langGo
+    check langFromString("golang") == langGo
+    check langFromString("js") == langCStyle
+    check langFromString("jsx") == langCStyle
+    check langFromString("typescript") == langCStyle
+    check langFromString("tsx") == langCStyle
+    check langFromString("c") == langCStyle
+    check langFromString("c++") == langCStyle
+    check langFromString("hpp") == langCStyle
+    check langFromString("java") == langCStyle
+    check langFromString("php") == langCStyle
+    check langFromString("rust") == langUnknown
+    check langFromString("") == langUnknown
+
+  test "JSON Output Shape (recordFileAnalysis)":
+    var stats = Stats()
+    var opts = Options(jsonOutput: true, jsonArray: true)
+    let res = calculateComplexity("function foo() { if (a) { return 1; } return 0; }", langCStyle)
+    let node = recordFileAnalysis("foo.js", res, stats, opts)
+    check node["file"].getStr() == "foo.js"
+    check node["complexity"].getBiggestInt() == 2
+    check node["functions"].getBiggestInt() == 1
+    check node["pcc"].getFloat() == 2.0
+    check node["function_list"].len == 1
+    check node["function_list"][0]["name"].getStr() == "foo"
+    check node["function_list"][0]["complexity"].getBiggestInt() == 2
+    check stats.count == 1
+    check stats.total == 2
+    check stats.max == 2
+    check stats.totalFunctions == 1
+
+  test "Max Complexity Threshold Counting":
+    var stats = Stats()
+    var opts = Options(jsonOutput: true, jsonArray: true, maxComplexity: 2)
+    let r1 = calculateComplexity("function a() { if (x) { return 1; } return 0; }", langCStyle)
+    let r2 = calculateComplexity("function b() { if (x) { if (y) { return 1; } } return 0; }", langCStyle)
+    check r1.complexity == 2
+    check r2.complexity == 3
+    discard recordFileAnalysis("a.js", r1, stats, opts)
+    discard recordFileAnalysis("b.js", r2, stats, opts)
+    check stats.filesOverThreshold == 1
+    check stats.count == 2
+
+  test "Directory Walk with Exclude Patterns":
+    let tmpDir = createTempDir("cyclomat_test_", "")
+    try:
+      createDir(tmpDir / "vendor")
+      writeFile(tmpDir / "a.js", "function f() { if (x) { return 1; } }")
+      writeFile(tmpDir / "b.py", "def g():\n    if True:\n        pass\n")
+      writeFile(tmpDir / "vendor/c.js", "function v() { if (x) { return 1; } }")
+      writeFile(tmpDir / "notes.txt", "if if if")
+
+      var stats = Stats()
+      var opts = Options(jsonOutput: true, jsonArray: true,
+                         langOverride: langUnknown, excludePatterns: @["vendor"])
+      var jsonList: seq[JsonNode] = @[]
+      walk(tmpDir, stats, opts, jsonList)
+
+      # vendor/c.js excluded, notes.txt unsupported language
+      check stats.count == 2
+      check jsonList.len == 2
+      var files: seq[string] = @[]
+      for j in jsonList: files.add(j["file"].getStr())
+      check (tmpDir / "a.js") in files
+      check (tmpDir / "b.py") in files
+    finally:
+      removeFile(tmpDir / "a.js")
+      removeFile(tmpDir / "b.py")
+      removeFile(tmpDir / "vendor/c.js")
+      removeFile(tmpDir / "notes.txt")
+      removeDir(tmpDir / "vendor")
+      removeDir(tmpDir)
