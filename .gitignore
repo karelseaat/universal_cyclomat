@@ -2,7 +2,11 @@
 nimcache/
 *.out
 src/cyclomat
+cyclomat
+cyclomat.so
+cyclomat.pyd
 *.exe
+tests/test_cyclomat
 
 # System
 .DS_Store

@@ -9,8 +9,9 @@ A lightweight, fast, and universal tool to measure cyclomatic complexity across 
 - 📊 **Statistics**: View total, average, min, and max complexity.
 - 🤖 **CI/CD Ready**: Set complexity thresholds (`--max`) to fail builds on complex code.
 - 🔬 **PCC Metric**: Calculates Pseudo-Cyclomatic Complexity (Complexity / Function Count) to estimate function-level complexity.
-- 📄 **JSON Output**: Easy integration with other tools.
+- 📄 **JSON Output**: Easy integration with other tools. Use `--json-array` for batch output.
 - 🔍 **Flexible**: Exclude patterns and recursive directory scanning.
+- 🔧 **Language Override**: Use `--lang` for stdin or non-standard language mappings.
 
 ## Installation
 
@@ -47,8 +48,13 @@ make pylib
 |------|-------------|
 | `-s`, `--stats` | Show summary statistics (Total, Avg, Max, Min) |
 | `-j`, `--json` | Output results in JSON format |
+| `--json-array` | Output results as a JSON array (instead of NDJSON) |
+| `-f`, `--functions` | Show per-function complexity breakdown |
 | `-m`, `--max:N` | Fail (exit code 1) if any file exceeds complexity N |
 | `-e`, `--exclude:PAT` | Exclude files or directories matching the pattern |
+| `--lang:LANG` | Override language (python, js, ts, go, php, c, cpp, java) |
+| `-h`, `--help` | Show help message |
+| `-V`, `--version` | Show version information |
 
 ### Examples
 
@@ -70,6 +76,31 @@ make pylib
 **Ignore folders**
 ```bash
 ./cyclomat --exclude:tests --exclude:vendor src/
+```
+
+**JSON Output (NDJSON)**
+```bash
+./cyclomat --json src/
+# {"file": "src/utils.js", "complexity": 10, "functions": 4, "pcc": 2.5, "function_list": [{"name": "foo", "complexity": 4, "line": 1}]}
+```
+
+**JSON Array Output**
+```bash
+./cyclomat --json --json-array src/
+# [{"file": "src/utils.js", "complexity": 10, "functions": 4, "pcc": 2.5, "function_list": [...]}]
+```
+
+**Per-Function Breakdown**
+```bash
+./cyclomat --functions src/
+# src/utils.js: 10 (PCC: 2.50)
+#   foo: 4 (line 1)
+#   bar: 6 (line 12)
+```
+
+**Analyze from stdin**
+```bash
+cat src/utils.js | ./cyclomat --lang js -
 ```
 
 ## Python Library Usage

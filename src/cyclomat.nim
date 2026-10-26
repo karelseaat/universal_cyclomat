@@ -1,382 +1,783 @@
 import os, strutils, strformat, parseopt, json
+import config
 
-# Conditional import for Python Library mode
 when defined(python):
   import nimpy
+  import nimpy/py_utils
+  import nimpy/py_lib
 
 type
-  Language = enum
+  Language* = enum
     langPython, langCStyle, langGo, langUnknown
-  
-  Stats = object
-    count: int
-    total: int
-    min: int
-    max: int
-    filesOverThreshold: int
-    totalFunctions: int
-    
-  Options = object
-    showStats: bool
-    jsonOutput: bool
-    maxComplexity: int # 0 means no limit
-    excludePatterns: seq[string]
-    paths: seq[string]
 
-proc detectLanguage(filename: string): Language =
+  FuncInfo* = object
+    name*: string
+    complexity*: int
+    line*: int
+
+  AnalysisResult* = object
+    complexity*: int
+    functions*: int
+    funcList*: seq[FuncInfo]
+
+  Stats* = object
+    count*: int
+    total*: int
+    min*: int
+    max*: int
+    filesOverThreshold*: int
+    totalFunctions*: int
+    maxFuncComplexity*: int
+    maxFuncName*: string
+    maxFuncFile*: string
+
+  Options* = object
+    showStats*: bool
+    jsonOutput*: bool
+    jsonArray*: bool
+    showFunctions*: bool
+    maxComplexity*: int
+    langOverride*: Language
+    langName*: string
+    excludePatterns*: seq[string]
+    paths*: seq[string]
+
+  FuncFrame = object
+    name: string
+    startCx: int
+    line: int
+    depth: int # braceDepth for C-style/Go, indent for Python
+
+proc detectLanguage*(filename: string): Language =
   let ext = splitFile(filename).ext.toLowerAscii()
   case ext
-  # Python
   of ".py": return langPython
-  
-  # C-Style Languages (Java, JS, PHP, C, C++, TypeScript)
-  of ".java", ".js", ".jsx", ".ts", ".tsx", ".php": return langCStyle
-  of ".c", ".h": return langCStyle
-  of ".cpp", ".hpp", ".cc", ".hh", ".cxx": return langCStyle
-
-  # Go
+  of ".java", ".js", ".jsx", ".ts", ".tsx", ".php", ".mjs", ".cjs", ".mts", ".cts": return langCStyle
+  of ".c", ".h", ".cpp", ".hpp", ".cc", ".hh", ".cxx": return langCStyle
   of ".go": return langGo
-  
   else: return langUnknown
 
-proc skipString(content: string, start: int, quote: string): int =
+proc isTsExt*(ext: string): bool =
+  let e = ext.toLowerAscii()
+  return e in [".ts", ".tsx", ".mts", ".cts"]
+
+proc isPhpExt*(ext: string): bool =
+  let e = ext.toLowerAscii()
+  return e == ".php"
+
+proc langFromString*(s: string): Language =
+  case s.toLowerAscii()
+  of "py", "python": langPython
+  of "go", "golang": langGo
+  of "c", "h", "cpp", "c++", "hpp", "java", "js", "javascript", "jsx", "ts", "typescript", "tsx", "php": langCStyle
+  else: langUnknown
+
+# Recursive glob pattern matching (* and ?)
+proc globMatch*(pattern, text: string): bool =
+  var pi = 0
+  var ti = 0
+  var starP = -1
+  var starT = -1
+  while ti < text.len:
+    if pi < pattern.len and (pattern[pi] == '?' or pattern[pi] == text[ti]):
+      pi.inc
+      ti.inc
+    elif pi < pattern.len and pattern[pi] == '*':
+      starP = pi
+      starT = ti
+      pi.inc
+    elif starP >= 0:
+      pi = starP + 1
+      starT.inc
+      ti = starT
+    else:
+      return false
+  while pi < pattern.len and pattern[pi] == '*':
+    pi.inc
+  return pi == pattern.len
+
+proc isExcluded*(path: string, patterns: seq[string]): bool =
+  if patterns.len == 0: return false
+  let normalizedPath = path.replace('\\', '/')
+  let base = splitFile(normalizedPath).name & splitFile(normalizedPath).ext
+  let parts = normalizedPath.split('/')
+
+  for pat in patterns:
+    let normPat = pat.replace('\\', '/')
+    if globMatch(normPat, normalizedPath) or globMatch(normPat, base):
+      return true
+    if '/' notin normPat:
+      for part in parts:
+        if part.len > 0 and globMatch(normPat, part):
+          return true
+  return false
+
+proc skipString(content: string, start: int, quote: string, res: var string): int =
   var i = start + quote.len
   while i < content.len:
-    # Check for end quote match
     if i + quote.len <= content.len and content[i ..< i+quote.len] == quote:
       return i + quote.len
-      
-    # Handle escapes (basic)
-    if content[i] == '\\': 
-      i += 2 
-    else: 
+    if content[i] == '\\' and quote != "'''" and quote != "`":
+      if i + 1 < content.len and content[i+1] == '\n':
+        res.add('\n')
+      i += 2
+    else:
+      if content[i] == '\n':
+        res.add('\n')
       i += 1
   return i
 
-proc cleanSource(content: string, lang: Language): string =
+proc cleanSource*(content: string, lang: Language): string =
   var i = 0
   var res = newStringOfCap(content.len)
-  
-  if lang == langCStyle:
+
+  case lang
+  of langCStyle, langGo:
     while i < content.len:
-      # Single line comment
-      if i+1 < content.len and content[i] == '/' and content[i+1] == '/':
+      # Single-line comment
+      if i + 1 < content.len and content[i] == '/' and content[i+1] == '/':
         i += 2
-        while i < content.len and content[i] != '\n': i.inc
-        res.add('\n')
-      # Multi line comment
-      elif i+1 < content.len and content[i] == '/' and content[i+1] == '*':
+        while i < content.len and content[i] != '\n':
+          i.inc
+      # Multi-line comment
+      elif i + 1 < content.len and content[i] == '/' and content[i+1] == '*':
         i += 2
-        while i+1 < content.len and not (content[i] == '*' and content[i+1] == '/'): i.inc
-        i += 2
-      # Strings
-      elif content[i] == '"' or content[i] == '\'':
-        let q = $content[i]
-        res.add(q & q) # Keep empty string to preserve structure
-        i = skipString(content, i, q)
-      else:
-        res.add(content[i])
-        i.inc
-        
-  elif lang == langGo:
-    while i < content.len:
-      # Single line comment
-      if i+1 < content.len and content[i] == '/' and content[i+1] == '/':
-        i += 2
-        while i < content.len and content[i] != '\n': i.inc
-        res.add('\n')
-      # Multi line comment
-      elif i+1 < content.len and content[i] == '/' and content[i+1] == '*':
-        i += 2
-        while i+1 < content.len and not (content[i] == '*' and content[i+1] == '/'): i.inc
-        i += 2
-      # Raw Strings (backticks)
+        while i + 1 < content.len and not (content[i] == '*' and content[i+1] == '/'):
+          if content[i] == '\n':
+            res.add('\n')
+          i.inc
+        i = min(i + 2, content.len)
+      # Template literals / raw strings
       elif content[i] == '`':
-        let q = "`"
         res.add("``")
-        i = skipString(content, i, q)
-      # Strings
+        i = skipString(content, i, "`", res)
+      # Double / single quote strings
       elif content[i] == '"' or content[i] == '\'':
         let q = $content[i]
         res.add(q & q)
-        i = skipString(content, i, q)
+        i = skipString(content, i, q, res)
       else:
         res.add(content[i])
         i.inc
-        
-  elif lang == langPython:
+
+  of langPython:
     while i < content.len:
       # Comments
       if content[i] == '#':
-        while i < content.len and content[i] != '\n': i.inc
-        res.add('\n')
+        while i < content.len and content[i] != '\n':
+          i.inc
       # Triple quotes
-      elif i+2 < content.len and content[i ..< i+3] == "\"\"\"":
+      elif i + 2 < content.len and content[i ..< i+3] == "\"\"\"":
         res.add("\"\"\"\"\"\"")
-        i = skipString(content, i, "\"\"\"")
-      elif i+2 < content.len and content[i ..< i+3] == "'''":
+        i = skipString(content, i, "\"\"\"", res)
+      elif i + 2 < content.len and content[i ..< i+3] == "'''":
         res.add("''''''")
-        i = skipString(content, i, "'''")
+        i = skipString(content, i, "'''", res)
       # Single quotes
       elif content[i] == '"' or content[i] == '\'':
         let q = $content[i]
         res.add(q & q)
-        i = skipString(content, i, q)
+        i = skipString(content, i, q, res)
       else:
         res.add(content[i])
         i.inc
+
   else:
     return content
-  
+
   return res
 
-proc calculateComplexity(originalContent: string, lang: Language): tuple[complexity: int, functions: int] =
+proc isNullableTypePos(content: string, qpos: int): bool =
+  if qpos < 0 or qpos >= content.len:
+    return false
+  let nextCh = content[qpos + 1]
+  if nextCh notin {'a'..'z', 'A'..'Z', '_', '$'}:
+    return false
+  var j = qpos - 1
+  while j >= 0 and content[j] in {' ', '\t'}:
+    j.dec
+  if j < 0:
+    return false
+  let beforeCh = content[j]
+  if beforeCh in {'(', ',', ':', '<', '&'}:
+    return true
+  var ls = j
+  while ls > 0 and content[ls-1] notin {'\n', '\r'}:
+    ls.dec
+  var word = ""
+  var k = ls
+  while k <= j and content[k] in {'a'..'z', 'A'..'Z', '0'..'9', '_'}:
+    word.add(content[k])
+    k.inc
+  if word in ["public", "private", "protected", "static", "var", "readonly", "final", "abstract", "internal"]:
+    return true
+  if word.startsWith("$"):
+    return false
+  return false
+
+proc calculateComplexity*(content: string, lang: Language, tsLike: bool = false, phpLike: bool = false): AnalysisResult =
   var complexity = 1
   var functions = 0
-  
-  # Strip comments and strings to avoid false positives
-  let content = cleanSource(originalContent, lang)
-  
-  # Keyword sets
-  var keywords: seq[string]
+  var funcList: seq[FuncInfo] = @[]
+  var funcStack: seq[FuncFrame] = @[]
+
+  let cleaned = cleanSource(content, lang)
+
+  const
+    controlKeywords = [
+      "if", "for", "while", "switch", "catch", "foreach", "do", "else", "try",
+      "finally", "synchronized", "sync", "with", "using", "lock", "match", "elseif",
+      "return", "break", "continue"
+    ]
+    pythonKeywords = ["if", "elif", "for", "while", "except", "and", "or", "match", "case"]
+    cstyleKeywords = ["if", "for", "while", "case", "catch", "elseif", "foreach"]
+    goKeywords = ["if", "for", "case", "default"]
+
+  var keywords: seq[string] = @[]
   if lang == langPython:
-    keywords = @["if", "elif", "for", "while", "except", "and", "or"]
+    keywords = @pythonKeywords
   elif lang == langCStyle:
-    keywords = @["if", "for", "while", "case", "catch"]
+    keywords = @cstyleKeywords
   elif lang == langGo:
-    keywords = @["if", "for", "case"] # Go has no while (uses for), select is container (cases count)
+    keywords = @goKeywords
   else:
-    return (0, 0)
+    return AnalysisResult(complexity: 0, functions: 0, funcList: @[])
 
-  # State for function counting (C-Style)
-  var expectingBlock = false
-  var lastNonSpaceChar: char = '\0'
+  var currentLine = 1
+  var parenDepth = 0
+  var braceDepth = 0
 
-  # Tokenize and count
+  var lastWord = ""
+  var topParenName = ""
+  var justClosedTopParen = false
+  var afterArrow = false
+  var arrowName = "(arrow)"
+  var pendingControlKw = ""
+
   var i = 0
-  while i < content.len:
-    # Skip whitespace but track last char
-    if content[i] in {' ', '\t', '\n', '\r'}:
+  while i < cleaned.len:
+    let ch = cleaned[i]
+
+    if ch == '\n':
+      currentLine.inc
+      i.inc
+
+      # Python function indentation check on newline
+      if lang == langPython and parenDepth == 0 and funcStack.len > 0:
+        var j = i
+        while j < cleaned.len and cleaned[j] in {' ', '\t'}:
+          j.inc
+        if j < cleaned.len and cleaned[j] notin {'\n', '\r'}:
+          var ls = j
+          while ls > 0 and cleaned[ls-1] notin {'\n', '\r'}:
+            ls.dec
+          var indent = 0
+          var k = ls
+          while k < j and cleaned[k] in {' ', '\t'}:
+            k.inc
+            indent.inc
+
+          while funcStack.len > 0 and indent <= funcStack[^1].depth:
+            let f = funcStack.pop()
+            let fnCx = (complexity - f.startCx) + 1
+            funcList.add(FuncInfo(name: f.name, complexity: fnCx, line: f.line))
+      continue
+
+    if ch in {' ', '\t', '\r'}:
       i.inc
       continue
 
-    # Handle words (keywords)
-    if content[i] in {'a'..'z', 'A'..'Z', '_'}:
+    # Words / Identifiers
+    if ch in {'a'..'z', 'A'..'Z', '_'}:
       var word = ""
-      while i < content.len and (content[i] in {'a'..'z', 'A'..'Z', '0'..'9', '_'}):
-        word.add(content[i])
+      let wordStart = i
+      while i < cleaned.len and (cleaned[i] in {'a'..'z', 'A'..'Z', '0'..'9', '_'}):
+        word.add(cleaned[i])
         i.inc
-      
-      # Determine keyword match
-      var isKeyword = false
-      for k in keywords:
-        if word == k:
-          complexity += 1
-          if lang == langCStyle: expectingBlock = true
-          isKeyword = true
-          break
-      
-      # Function counting
-      if lang == langPython:
-         if word == "def": functions += 1
-      elif lang == langGo:
-         if word == "func": functions += 1
-      # Removed CStyle "function" because ') {' heuristic covers it
-      
-      # Correctly update lastNonSpaceChar: it should be the LAST char of the word
-      if word.len > 0: lastNonSpaceChar = word[word.len-1]
+
+      let prevChar = if wordStart > 0: cleaned[wordStart-1] else: '\0'
+
+      # Check keyword match (require prevChar != '.' to avoid false positives like obj.match or re.match)
+      if prevChar != '.':
+        for k in keywords:
+          if word == k:
+            complexity += 1
+            break
+
+      # Control keyword tracking
+      if prevChar != '.' and word in controlKeywords:
+        pendingControlKw = word
+        justClosedTopParen = false # Control keywords break function header sequence
+
+      # Python def detection
+      if lang == langPython and word == "def" and prevChar != '.':
+        functions += 1
+        var p = i
+        while p < cleaned.len and cleaned[p] in {' ', '\t'}:
+          p.inc
+        var fnName = ""
+        while p < cleaned.len and (cleaned[p] in {'a'..'z', 'A'..'Z', '0'..'9', '_'}):
+          fnName.add(cleaned[p])
+          p.inc
+        if fnName.len == 0:
+          fnName = "(anonymous)"
+
+        var ls = wordStart
+        while ls > 0 and cleaned[ls-1] notin {'\n', '\r'}:
+          ls.dec
+        var ind = 0
+        var k = ls
+        while k < wordStart and cleaned[k] in {' ', '\t'}:
+          k.inc
+          ind.inc
+
+        funcStack.add(FuncFrame(name: fnName, startCx: complexity, line: currentLine, depth: ind))
+
+      lastWord = word
       continue
 
-    # Handle Operators and Punctuation
+    # Operators and Punctuation
     else:
-      let c = content[i]
-      var handled = false
-      
-      # Function heuristic Check BEFORE updating lastNonSpaceChar
-      if lang == langCStyle:
-         if c == '{':
-           if lastNonSpaceChar == ')' and not expectingBlock:
-               functions += 1
-           expectingBlock = false
-           # We processed {
-         elif c == '}' or c == ';':
-           expectingBlock = false
-
-      # Handle C-Style operators (and Go)
-      if lang == langCStyle or lang == langGo:
-        if c == '?' and (i+1 >= content.len or content[i+1] != '?'):
-          if lang != langGo:
-             complexity += 1
-          lastNonSpaceChar = '?'
-          i.inc
-          handled = true
-        elif i+1 < content.len and (
-           (content[i] == '&' and content[i+1] == '&') or
-           (content[i] == '|' and content[i+1] == '|')
-        ):
-          complexity += 1
-          lastNonSpaceChar = content[i+1]
-          i += 2
-          handled = true
-        
-        # JS/TS Arrow functions
-        elif lang == langCStyle and i+1 < content.len and content[i] == '=' and content[i+1] == '>':
-           functions += 1
-           lastNonSpaceChar = '>'
-           i += 2
-           handled = true
-      
-      if not handled:
-        lastNonSpaceChar = c
+      case ch
+      of '(':
+        if parenDepth == 0:
+          if pendingControlKw.len > 0:
+            topParenName = pendingControlKw
+          elif lastWord.len > 0:
+            topParenName = lastWord
+          else:
+            topParenName = ""
+        parenDepth.inc
+        justClosedTopParen = false
         i.inc
 
+      of ')':
+        if parenDepth > 0:
+          parenDepth.dec
+        if parenDepth == 0:
+          justClosedTopParen = true
+        i.inc
 
-  # Ensure at least 1 function to avoid division by zero if file is not empty
-  if functions == 0 and content.strip().len > 0:
+      of '{':
+        braceDepth.inc
+        if (lang == langCStyle or lang == langGo) and justClosedTopParen and topParenName notin controlKeywords:
+          functions += 1
+          var displayFnName = topParenName
+          if displayFnName.len == 0 or displayFnName == "function" or displayFnName == "func" or displayFnName == "fn":
+            displayFnName = "(anonymous)"
+          funcStack.add(FuncFrame(name: displayFnName, startCx: complexity, line: currentLine, depth: braceDepth))
+        elif (lang == langCStyle or lang == langGo) and afterArrow:
+          funcStack.add(FuncFrame(name: arrowName, startCx: complexity, line: currentLine, depth: braceDepth))
+
+        justClosedTopParen = false
+        afterArrow = false
+        pendingControlKw = ""
+        i.inc
+
+      of '}':
+        if (lang == langCStyle or lang == langGo) and funcStack.len > 0 and funcStack[^1].depth == braceDepth:
+          let f = funcStack.pop()
+          let fnCx = (complexity - f.startCx) + 1
+          funcList.add(FuncInfo(name: f.name, complexity: fnCx, line: f.line))
+        if braceDepth > 0:
+          braceDepth.dec
+        justClosedTopParen = false
+        afterArrow = false
+        pendingControlKw = ""
+        i.inc
+
+      of ';':
+        justClosedTopParen = false
+        pendingControlKw = ""
+        afterArrow = false
+        i.inc
+
+      of '?':
+        if lang == langCStyle:
+          if i > 0 and cleaned[i-1] == '<':
+            i += 1 # PHP open tag, skip the '?'
+          elif i + 1 < cleaned.len and cleaned[i+1] == '>':
+            i += 2 # PHP close tag, skip ?>
+          elif i + 1 < cleaned.len and cleaned[i+1] == '-' and i + 2 < cleaned.len and cleaned[i+2] == '>':
+            i += 3 # PHP nullsafe ?->
+          elif phpLike and isNullableTypePos(cleaned, i):
+            i += 1 # Nullable type like ?string, not a ternary
+          elif i + 1 < cleaned.len and cleaned[i+1] == '?':
+            i += 2 # Nullish coalescing ??
+          elif i + 1 < cleaned.len and cleaned[i+1] == '.':
+            i += 2 # Optional chaining ?.
+          elif tsLike and i + 1 < cleaned.len:
+            var p = i + 1
+            while p < cleaned.len and cleaned[p] in {' ', '\t'}:
+              p.inc
+            if p < cleaned.len and cleaned[p] == ':':
+              i += 1 # Skip optional param ?
+            else:
+              complexity += 1
+              i += 1
+          else:
+            complexity += 1
+            i += 1
+        else:
+          i += 1
+
+      of '=':
+        if (lang == langCStyle or lang == langGo) and i + 1 < cleaned.len and cleaned[i+1] == '>':
+          if justClosedTopParen and topParenName.len > 0 and topParenName notin controlKeywords and topParenName notin ["fn", "function", "func"]:
+            arrowName = topParenName
+          if justClosedTopParen:
+            functions += 1
+            afterArrow = true
+            justClosedTopParen = false
+            i += 2
+          else:
+            i += 2
+        else:
+          justClosedTopParen = false
+          i += 1
+
+      of '&':
+        if (lang == langCStyle or lang == langGo) and i + 1 < cleaned.len and cleaned[i+1] == '&':
+          complexity += 1
+          i += 2
+        else:
+          i += 1
+
+      of '|':
+        if (lang == langCStyle or lang == langGo) and i + 1 < cleaned.len and cleaned[i+1] == '|':
+          complexity += 1
+          i += 2
+        else:
+          i += 1
+
+      else:
+        i.inc
+
+  # Pop remaining functions at EOF
+  while funcStack.len > 0:
+    let f = funcStack.pop()
+    let fnCx = (complexity - f.startCx) + 1
+    funcList.add(FuncInfo(name: f.name, complexity: fnCx, line: f.line))
+
+  # Fallback: if file has non-empty content, ensure at least 1 function count
+  if functions == 0 and cleaned.strip().len > 0:
     functions = 1
-    
-  return (complexity, functions)
+
+  return AnalysisResult(complexity: complexity, functions: functions, funcList: funcList)
 
 # ---------------------------------------------------------------------------
-# Python API
+# Python Extension API
 # ---------------------------------------------------------------------------
 
 when defined(python):
-  proc analyze_file(filename: string): PyObject {.exportpy.} =
+  proc analysisToPyDict(filename: string, res: AnalysisResult): PyObject =
+    let dict = pyDict()
+    let pcc = if res.functions > 0: res.complexity.float / res.functions.float else: 0.0
+    dict["file"] = filename
+    dict["complexity"] = res.complexity
+    dict["functions"] = res.functions
+    dict["pcc"] = pcc
+
+    let rawList = pyLib.PyList_New(0)
+    if rawList.isNil:
+      raise newException(ValueError, "Failed to create Python list")
+    var flist: PyObject
+    flist.rawPyObj = rawList
+    for f in res.funcList:
+      let fd = pyDict()
+      fd["name"] = f.name
+      fd["complexity"] = f.complexity
+      fd["line"] = f.line
+      flist.append(fd)
+    dict["function_list"] = flist
+    return dict
+
+  proc analyze_file*(filename: string): PyObject {.exportpy.} =
     let lang = detectLanguage(filename)
     if lang == langUnknown:
-      return pyDict() # Return empty dict if unknown language
+      return pyDict()
 
     try:
       let content = readFile(filename)
-      let (c, f) = calculateComplexity(content, lang)
-      let pcc = if f > 0: c.float / f.float else: 0.0
-      
-      let res = pyDict()
-      res["file"] = filename
-      res["complexity"] = c
-      res["functions"] = f
-      res["pcc"] = pcc
-      return res
-    except:
+      let tsLike = isTsExt(splitFile(filename).ext)
+      let phpLike = isPhpExt(splitFile(filename).ext) and lang == langCStyle
+      let res = calculateComplexity(content, lang, tsLike, phpLike)
+      return analysisToPyDict(filename, res)
+    except CatchableError:
       return pyDict()
 
-  proc analyze_content(content: string, filename: string): PyObject {.exportpy.} =
+  proc analyze_content*(content: string, filename: string): PyObject {.exportpy.} =
     let lang = detectLanguage(filename)
     if lang == langUnknown:
       return pyDict()
 
-    let (c, f) = calculateComplexity(content, lang)
-    let pcc = if f > 0: c.float / f.float else: 0.0
-    
-    let res = pyDict()
-    res["file"] = filename
-    res["complexity"] = c
-    res["functions"] = f
-    res["pcc"] = pcc
-    return res
+    try:
+      let tsLike = isTsExt(splitFile(filename).ext)
+      let phpLike = isPhpExt(splitFile(filename).ext) and lang == langCStyle
+      let res = calculateComplexity(content, lang, tsLike, phpLike)
+      return analysisToPyDict(filename, res)
+    except CatchableError:
+      return pyDict()
 
 # ---------------------------------------------------------------------------
 # CLI Implementation
 # ---------------------------------------------------------------------------
 
-proc processFile(filename: string, stats: var Stats, opts: Options) =
-  # Check exclusions first
-  for pattern in opts.excludePatterns:
-    if filename.contains(pattern): return
+proc recordFileAnalysis(filename: string, res: AnalysisResult, stats: var Stats, opts: Options): JsonNode =
+  let pcc = if res.functions > 0: res.complexity.float / res.functions.float else: 0.0
 
-  let lang = detectLanguage(filename)
-  if lang == langUnknown: return
+  stats.count += 1
+  stats.total += res.complexity
+  stats.totalFunctions += res.functions
+  if stats.min == -1 or res.complexity < stats.min: stats.min = res.complexity
+  if res.complexity > stats.max: stats.max = res.complexity
+
+  if opts.maxComplexity > 0 and res.complexity > opts.maxComplexity:
+    stats.filesOverThreshold += 1
+
+  for f in res.funcList:
+    if f.complexity > stats.maxFuncComplexity:
+      stats.maxFuncComplexity = f.complexity
+      stats.maxFuncName = f.name
+      stats.maxFuncFile = filename
+
+  var jFList = newJArray()
+  for f in res.funcList:
+    jFList.add(%*{"name": f.name, "complexity": f.complexity, "line": f.line})
+
+  let jObj = %*{
+    "file": filename,
+    "complexity": res.complexity,
+    "functions": res.functions,
+    "pcc": pcc,
+    "function_list": jFList
+  }
+
+  if opts.jsonOutput and not opts.jsonArray:
+    echo $jObj
+  elif not opts.jsonOutput:
+    if opts.maxComplexity > 0 and res.complexity > opts.maxComplexity:
+      echo fmt"{filename}: {res.complexity} (PCC: {pcc:.2f}) (EXCEEDS {opts.maxComplexity})"
+    else:
+      echo fmt"{filename}: {res.complexity} (PCC: {pcc:.2f})"
+
+    if opts.showFunctions and res.funcList.len > 0:
+      for f in res.funcList:
+        echo fmt"  {f.name}: {f.complexity} (line {f.line})"
+
+  return jObj
+
+proc processContent(content, filename: string, lang: Language, tsLike: bool, phpLike: bool, stats: var Stats, opts: Options): JsonNode =
+  let res = calculateComplexity(content, lang, tsLike, phpLike)
+  return recordFileAnalysis(filename, res, stats, opts)
+
+proc processFile(filename: string, stats: var Stats, opts: Options): JsonNode =
+  if isExcluded(filename, opts.excludePatterns):
+    return nil
+
+  var lang = opts.langOverride
+  if lang == langUnknown:
+    lang = detectLanguage(filename)
+  if lang == langUnknown:
+    return nil
+
+  var tsLike = false
+  var phpLike = false
+  if opts.langOverride != langUnknown:
+    let ln = opts.langName.toLowerAscii()
+    tsLike = ln in ["ts", "tsx", "typescript", "mts", "cts"]
+    phpLike = ln == "php"
+  else:
+    tsLike = isTsExt(splitFile(filename).ext)
+    phpLike = isPhpExt(splitFile(filename).ext)
 
   try:
     let content = readFile(filename)
-    let (c, functions) = calculateComplexity(content, lang)
-    let pcc = if functions > 0: c.float / functions.float else: 0.0
-    
-    if opts.jsonOutput:
-      # Fix: Use explicit type and conversion to string to resolve ambiguity
-      var jObj = %*{"file": filename, "complexity": c, "functions": functions, "pcc": pcc}
-      echo $jObj
-    else:
-      if opts.maxComplexity > 0 and c > opts.maxComplexity:
-        echo fmt"{filename}: {c} (PCC: {pcc:.2f}) (EXCEEDS {opts.maxComplexity})"
-      else:
-        echo fmt"{filename}: {c} (PCC: {pcc:.2f})"
-    
-    stats.count += 1
-    stats.total += c
-    stats.totalFunctions += functions
-    if stats.min == -1 or c < stats.min: stats.min = c
-    if c > stats.max: stats.max = c
-    
-    if opts.maxComplexity > 0 and c > opts.maxComplexity:
-      stats.filesOverThreshold += 1
-      
+    return processContent(content, filename, lang, tsLike, phpLike, stats, opts)
   except IOError:
     if not opts.jsonOutput:
-      echo fmt"Error reading {filename}"
+      stderr.writeLine(fmt"Error reading {filename}")
+    return nil
 
-proc walk(path: string, stats: var Stats, opts: Options) =
-  # Check exclusions for directories too
-  for pattern in opts.excludePatterns:
-    if path.contains(pattern): return
+proc walk(path: string, stats: var Stats, opts: Options, jsonList: var seq[JsonNode]) =
+  if isExcluded(path, opts.excludePatterns):
+    return
+
+  if path == "-":
+    var lang = opts.langOverride
+    if lang == langUnknown:
+      if not opts.jsonOutput:
+        stderr.writeLine("Error: Must specify --lang when reading from stdin (-)")
+      return
+    let content = stdin.readAll()
+    let tsLike = opts.langOverride != langUnknown and opts.langName.toLowerAscii() in ["ts", "tsx", "typescript", "mts", "cts"]
+    let phpLike = opts.langOverride != langUnknown and opts.langName.toLowerAscii() == "php"
+    let jNode = processContent(content, "<stdin>", lang, tsLike, phpLike, stats, opts)
+    if jNode != nil and opts.jsonArray:
+      jsonList.add(jNode)
+    return
 
   if fileExists(path):
-    processFile(path, stats, opts)
+    let jNode = processFile(path, stats, opts)
+    if jNode != nil and opts.jsonArray:
+      jsonList.add(jNode)
   elif dirExists(path):
+    let baseDir = splitFile(path.replace('\\', '/')).name
+    if baseDir == ".git":
+      return
     for kind, p in walkDir(path):
       if kind == pcFile:
-        processFile(p, stats, opts)
+        let jNode = processFile(p, stats, opts)
+        if jNode != nil and opts.jsonArray:
+          jsonList.add(jNode)
       elif kind == pcDir:
-        walk(p, stats, opts)
+        walk(p, stats, opts, jsonList)
   else:
     if not opts.jsonOutput:
-      echo fmt"Path not found: {path}"
+      stderr.writeLine(fmt"Path not found: {path}")
 
-proc main() =
+proc showHelp() =
+  echo fmt"{ToolName} v{Version} - Universal Cyclomatic Complexity Tool"
+  echo """
+Usage: cyclomat [options] <file_or_directory>...
+
+Options:
+  -s, --stats          Show summary statistics
+  -j, --json           Output results in NDJSON format
+  --json-array         Output results as a JSON array
+  -f, --functions      Show per-function complexity breakdown
+  -m, --max:N          Fail if complexity exceeds N
+  -e, --exclude:PAT    Exclude files/dirs matching pattern (supports * and ?)
+  --lang:LANG          Override language (python, js, ts, go, php, c, cpp, java)
+  -h, --help           Show this help message
+  -V, --version        Show version information
+"""
+
+proc showVersion() =
+  echo fmt"{ToolName} v{Version}"
+
+proc main*() =
   var opts = Options(
-    showStats: false, 
-    jsonOutput: false, 
-    maxComplexity: 0, 
-    excludePatterns: @[], 
+    showStats: false,
+    jsonOutput: false,
+    jsonArray: false,
+    showFunctions: false,
+    maxComplexity: 0,
+    langOverride: langUnknown,
+    langName: "",
+    excludePatterns: @[],
     paths: @[]
   )
-  
+
   var p = initOptParser()
   for kind, key, val in p.getopt():
     case kind
     of cmdLongOption, cmdShortOption:
+      if key == "":
+        opts.paths.add("-") # stdin
+        continue
       case key
       of "stats", "s": opts.showStats = true
       of "json", "j": opts.jsonOutput = true
-      of "max", "m": 
-        try: opts.maxComplexity = parseInt(val)
-        except ValueError: echo "Invalid max complexity value"
-      of "exclude", "e": opts.excludePatterns.add(val)
+      of "json-array":
+        opts.jsonOutput = true
+        opts.jsonArray = true
+      of "functions", "f": opts.showFunctions = true
+      of "max", "m":
+        try:
+          opts.maxComplexity = parseInt(val)
+        except ValueError:
+          stderr.writeLine("Invalid max complexity value: " & val)
+          quit(1)
+      of "exclude", "e":
+        opts.excludePatterns.add(val)
+      of "lang":
+        opts.langName = val.toLowerAscii()
+        opts.langOverride = langFromString(val)
+        if opts.langOverride == langUnknown:
+          stderr.writeLine("Unknown language specified for --lang: " & val)
+          quit(1)
+      of "help", "h":
+        showHelp()
+        quit(0)
+      of "version", "V":
+        showVersion()
+        quit(0)
+      else:
+        stderr.writeLine("Unknown option: " & key)
     of cmdArgument:
       opts.paths.add(key)
-    of cmdEnd: break
-  
-  if opts.paths.len == 0:
-    echo """Usage: cyclomat [options] <file_or_directory>...
+    of cmdEnd:
+      break
 
-Options:
-  -s, --stats          Show summary statistics
-  -j, --json           Output results in JSON format
-  -m, --max:N          Fail if complexity exceeds N
-  -e, --exclude:PAT    Exclude files/dirs matching pattern
-"""
+  if opts.paths.len == 0:
+    showHelp()
     quit(1)
 
-  var stats = Stats(count: 0, total: 0, min: -1, max: 0, filesOverThreshold: 0, totalFunctions: 0)
+  var stats = Stats(
+    count: 0,
+    total: 0,
+    min: -1,
+    max: 0,
+    filesOverThreshold: 0,
+    totalFunctions: 0,
+    maxFuncComplexity: 0,
+    maxFuncName: "",
+    maxFuncFile: ""
+  )
+
+  var jsonList: seq[JsonNode] = @[]
 
   for path in opts.paths:
-    walk(path, stats, opts)
-    
-  if opts.showStats and not opts.jsonOutput and stats.count > 0:
+    walk(path, stats, opts, jsonList)
+
+  # Output stats / json-array
+  if opts.jsonOutput:
+    if opts.jsonArray:
+      var outNode: JsonNode
+      if opts.showStats:
+        let avg = if stats.count > 0: stats.total.float / stats.count.float else: 0.0
+        let avgPcc = if stats.totalFunctions > 0: stats.total.float / stats.totalFunctions.float else: 0.0
+        let statsNode = %*{
+          "files": stats.count,
+          "total_complexity": stats.total,
+          "total_functions": stats.totalFunctions,
+          "avg_complexity": avg,
+          "avg_pcc": avgPcc,
+          "max_complexity": stats.max,
+          "min_complexity": stats.min,
+          "over_threshold": stats.filesOverThreshold,
+          "max_func_complexity": stats.maxFuncComplexity,
+          "max_func_name": stats.maxFuncName,
+          "max_func_file": stats.maxFuncFile
+        }
+        outNode = %*{"files": jsonList, "stats": statsNode}
+      else:
+        outNode = %jsonList
+      echo $outNode
+    elif opts.showStats:
+      let avg = if stats.count > 0: stats.total.float / stats.count.float else: 0.0
+      let avgPcc = if stats.totalFunctions > 0: stats.total.float / stats.totalFunctions.float else: 0.0
+      let statsNode = %*{
+        "stats": {
+          "files": stats.count,
+          "total_complexity": stats.total,
+          "total_functions": stats.totalFunctions,
+          "avg_complexity": avg,
+          "avg_pcc": avgPcc,
+          "max_complexity": stats.max,
+          "min_complexity": stats.min,
+          "over_threshold": stats.filesOverThreshold,
+          "max_func_complexity": stats.maxFuncComplexity,
+          "max_func_name": stats.maxFuncName,
+          "max_func_file": stats.maxFuncFile
+        }
+      }
+      echo $statsNode
+  elif opts.showStats and stats.count > 0:
     let avg = stats.total.float / stats.count.float
     let avgPcc = if stats.totalFunctions > 0: stats.total.float / stats.totalFunctions.float else: 0.0
-    
+
     echo "\n--------------------------------------------------"
     echo fmt"Total Files:       {stats.count}"
     echo fmt"Total Complexity:  {stats.total}"
@@ -385,6 +786,8 @@ Options:
     echo fmt"Average PCC:       {avgPcc:.2f} (complexity / function)"
     echo fmt"Max Complexity:    {stats.max}"
     echo fmt"Min Complexity:    {stats.min}"
+    if stats.maxFuncComplexity > 0:
+      echo fmt"Max Function Cx:   {stats.maxFuncComplexity} ({stats.maxFuncName} in {stats.maxFuncFile})"
     if opts.maxComplexity > 0:
       echo fmt"Files > {opts.maxComplexity}:      {stats.filesOverThreshold}"
     echo "--------------------------------------------------"
