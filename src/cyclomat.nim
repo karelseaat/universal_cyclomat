@@ -1,4 +1,4 @@
-import os, strutils, strformat, parseopt, json
+import os, strutils, strformat, parseopt, json, std/cmdline
 import config
 
 when defined(python):
@@ -41,6 +41,12 @@ type
     langName*: string
     excludePatterns*: seq[string]
     paths*: seq[string]
+
+  ## Raised by `parseArgs` for any terminal flow (help, version, bad input).
+  ## `main` catches it and calls the real `quit(e.code)` so the exit code
+  ## propagates without `parseArgs` being forced to hard-exit.
+  QuitSignal* = object of CatchableError
+    code*: int
 
   FuncFrame = object
     name: string
@@ -571,6 +577,15 @@ proc processContent(content, filename: string, lang: Language, tsLike: bool, php
   let res = calculateComplexity(content, lang, tsLike, phpLike)
   return recordFileAnalysis(filename, res, stats, opts)
 
+proc deriveTsPhpLike*(filename: string, opts: Options): tuple[tsLike, phpLike: bool] =
+  if opts.langOverride != langUnknown:
+    let ln = opts.langName.toLowerAscii()
+    result.tsLike = ln in ["ts", "tsx", "typescript", "mts", "cts"]
+    result.phpLike = ln == "php"
+  else:
+    result.tsLike = isTsExt(splitFile(filename).ext)
+    result.phpLike = isPhpExt(splitFile(filename).ext)
+
 proc processFile(filename: string, stats: var Stats, opts: Options): JsonNode =
   if isExcluded(filename, opts.excludePatterns):
     return nil
@@ -581,15 +596,7 @@ proc processFile(filename: string, stats: var Stats, opts: Options): JsonNode =
   if lang == langUnknown:
     return nil
 
-  var tsLike = false
-  var phpLike = false
-  if opts.langOverride != langUnknown:
-    let ln = opts.langName.toLowerAscii()
-    tsLike = ln in ["ts", "tsx", "typescript", "mts", "cts"]
-    phpLike = ln == "php"
-  else:
-    tsLike = isTsExt(splitFile(filename).ext)
-    phpLike = isPhpExt(splitFile(filename).ext)
+  let (tsLike, phpLike) = deriveTsPhpLike(filename, opts)
 
   try:
     let content = readFile(filename)
@@ -610,8 +617,7 @@ proc walk*(path: string, stats: var Stats, opts: Options, jsonList: var seq[Json
         stderr.writeLine("Error: Must specify --lang when reading from stdin (-)")
       return
     let content = stdin.readAll()
-    let tsLike = opts.langOverride != langUnknown and opts.langName.toLowerAscii() in ["ts", "tsx", "typescript", "mts", "cts"]
-    let phpLike = opts.langOverride != langUnknown and opts.langName.toLowerAscii() == "php"
+    let (tsLike, phpLike) = deriveTsPhpLike("<stdin>", opts)
     let jNode = processContent(content, "<stdin>", lang, tsLike, phpLike, stats, opts)
     if jNode != nil and opts.jsonArray:
       jsonList.add(jNode)
@@ -656,7 +662,11 @@ Options:
 proc showVersion() =
   echo fmt"{ToolName} v{Version}"
 
-proc main*() =
+proc newQuitSignal(code: int): ref QuitSignal =
+  result = new QuitSignal
+  result.code = code
+
+proc parseArgs*(args: seq[string]): Options =
   var opts = Options(
     showStats: false,
     jsonOutput: false,
@@ -669,8 +679,7 @@ proc main*() =
     paths: @[]
   )
 
-  var p = initOptParser()
-  for kind, key, val in p.getopt():
+  for kind, key, val in getopt(args):
     case kind
     of cmdLongOption, cmdShortOption:
       if key == "":
@@ -688,7 +697,7 @@ proc main*() =
           opts.maxComplexity = parseInt(val)
         except ValueError:
           stderr.writeLine("Invalid max complexity value: " & val)
-          quit(1)
+          raise newQuitSignal(1)
       of "exclude", "e":
         opts.excludePatterns.add(val)
       of "lang":
@@ -696,13 +705,13 @@ proc main*() =
         opts.langOverride = langFromString(val)
         if opts.langOverride == langUnknown:
           stderr.writeLine("Unknown language specified for --lang: " & val)
-          quit(1)
+          raise newQuitSignal(1)
       of "help", "h":
         showHelp()
-        quit(0)
+        raise newQuitSignal(0)
       of "version", "V":
         showVersion()
-        quit(0)
+        raise newQuitSignal(0)
       else:
         stderr.writeLine("Unknown option: " & key)
     of cmdArgument:
@@ -712,7 +721,16 @@ proc main*() =
 
   if opts.paths.len == 0:
     showHelp()
-    quit(1)
+    raise newQuitSignal(1)
+
+  return opts
+
+proc main*() =
+  var opts: Options
+  try:
+    opts = parseArgs(commandLineParams())
+  except QuitSignal as e:
+    quit(e.code)
 
   var stats = Stats(
     count: 0,

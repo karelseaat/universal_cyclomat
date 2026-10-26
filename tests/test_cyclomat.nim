@@ -4,6 +4,13 @@ import os
 import std/tempfiles
 import ../src/cyclomat
 
+proc parseTry(args: seq[string]): tuple[raised: bool, code: int, opts: Options] =
+  try:
+    let o = parseArgs(args)
+    result = (false, -1, o)
+  except QuitSignal as e:
+    result = (true, e.code, Options())
+
 suite "Cyclomat Test Suite":
 
   test "Language Detection":
@@ -295,4 +302,75 @@ int check(int a, int b) {
       removeFile(tmpDir / "vendor/c.js")
       removeFile(tmpDir / "notes.txt")
       removeDir(tmpDir / "vendor")
+      removeDir(tmpDir)
+
+  test "parseArgs terminal flows raise QuitSignal":
+    let r1 = parseTry(@["--help", "x.js"])
+    check r1.raised and r1.code == 0
+    let r2 = parseTry(@["--version"])
+    check r2.raised and r2.code == 0
+    let r3 = parseTry(@["--lang", "bogus", "x.js"])
+    check r3.raised and r3.code == 1
+    let r4 = parseTry(@["--max", "abc", "x.js"])
+    check r4.raised and r4.code == 1
+    let r5 = parseTry(@[])
+    check r5.raised and r5.code == 1
+
+  test "parseArgs flags and values":
+    let a = parseTry(@["-j", "f.js"]).opts
+    check a.jsonOutput and not a.jsonArray
+    let b = parseTry(@["--json-array", "f.js"]).opts
+    check b.jsonOutput and b.jsonArray
+    let c = parseTry(@["--max:5", "f.js"]).opts
+    check c.maxComplexity == 5
+    let d = parseTry(@["--lang:go", "f.js"]).opts
+    check d.langOverride == langGo
+    check d.langName == "go"
+    let e = parseTry(@["--lang:ts", "f.js"]).opts
+    check e.langOverride == langCStyle
+    check e.langName == "ts"
+    let f = parseTry(@["--exclude:vendor", "--exclude:build", "f.js"]).opts
+    check f.excludePatterns == @["vendor", "build"]
+    let g = parseTry(@["f.js", "g.py"]).opts
+    check g.paths == @["f.js", "g.py"]
+    let h = parseTry(@["-"])
+    check not h.raised
+    check h.opts.paths == @["-"]
+
+  test "deriveTsPhpLike override branch":
+    let ts = Options(langOverride: langCStyle, langName: "ts")
+    check deriveTsPhpLike("any.txt", ts) == (true, false)
+    let tsx = Options(langOverride: langCStyle, langName: "tsx")
+    check deriveTsPhpLike("any.txt", tsx) == (true, false)
+    let php = Options(langOverride: langCStyle, langName: "php")
+    check deriveTsPhpLike("any.txt", php) == (false, true)
+    let c = Options(langOverride: langCStyle, langName: "c")
+    check deriveTsPhpLike("any.txt", c) == (false, false)
+    let py = Options(langOverride: langPython, langName: "python")
+    check deriveTsPhpLike("any.txt", py) == (false, false)
+
+  test "deriveTsPhpLike extension branch":
+    let dflt = Options(langOverride: langUnknown)
+    check deriveTsPhpLike("x.ts", dflt) == (true, false)
+    check deriveTsPhpLike("x.tsx", dflt) == (true, false)
+    check deriveTsPhpLike("x.mts", dflt) == (true, false)
+    check deriveTsPhpLike("x.cts", dflt) == (true, false)
+    check deriveTsPhpLike("x.js", dflt) == (false, false)
+    check deriveTsPhpLike("x.php", dflt) == (false, true)
+    check deriveTsPhpLike("x.py", dflt) == (false, false)
+
+  test "processFile via walk: .txt analyzed with --lang override":
+    let tmpDir = createTempDir("cyclomat_lang_", "")
+    try:
+      writeFile(tmpDir / "notes.txt", "if (a) { if (b) { } }")
+      var stats = Stats()
+      var opts = Options(jsonOutput: true, jsonArray: true,
+                         langOverride: langCStyle, langName: "c")
+      var jsonList: seq[JsonNode] = @[]
+      walk(tmpDir, stats, opts, jsonList)
+      check stats.count == 1
+      check jsonList.len == 1
+      check jsonList[0]["complexity"].getBiggestInt() == 3
+    finally:
+      removeFile(tmpDir / "notes.txt")
       removeDir(tmpDir)
